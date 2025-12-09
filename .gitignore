@@ -17,6 +17,9 @@ data_v3/
 data_v3_town2_3/
 data_town04/
 data_merged/
+data_merged_all/
+data_raw/
+data_processed/
 
 # IDE
 .vscode/

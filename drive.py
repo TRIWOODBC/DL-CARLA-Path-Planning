@@ -1,369 +1,335 @@
-"""
-自动驾驶脚本 V2 - Stanley/Pure Pursuit + 模型融合
-参考更稳定的几何控制方法
-"""
-import sys
-import os
-import time
-import math
-import random
-import queue
+import sys, os, time, math, random, queue
 import numpy as np
 import cv2
 import torch
+import torch.nn as nn
 
+# 导入配置和工具
 from config import (
-    CARLA_EGG_PATH, CARLA_HOST, CARLA_PORT, CARLA_TIMEOUT,
-    MODEL_PATH, DEVICE,
+    CARLA_EGG_PATH, MODEL_PATH,
     CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FOV,
     CROP_TOP, CROP_BOTTOM, INPUT_WIDTH, INPUT_HEIGHT,
+    BASE_THROTTLE, MIN_THROTTLE, MAX_THROTTLE, THROTTLE_STEER_SCALE,
+    STEER_GAIN
 )
 from model import PilotNet
+from utils import get_speed
 
-sys.path.append(CARLA_EGG_PATH)
-import carla
+# ========= 驾驶配置 =========
+WORLD_NAME = 'Town01'
+USE_LOAD_WORLD = False
+USE_SYNC = False
+FIXED_DELTA = 0.05
 
+CAM_RES_X, CAM_RES_Y = CAMERA_WIDTH, CAMERA_HEIGHT
 
-# ========= 控制参数 =========
+# 模型标签单位
+LABEL_UNITS = 'norm'
+MAX_STEER_DEG = 35.0
+
 # 速度控制
-TARGET_SPEED = 5.0      # 目标速度 m/s（约18km/h）
-BASE_THROTTLE = 0.40
-MIN_THROTTLE = 0.22
-MAX_THROTTLE = 0.60
-KP_SPEED = 0.20         # 速度P控制增益
-THROTTLE_STEER_SCALE = 0.5  # 转弯时降油门
+TARGET_SPD = 4.0    # m/s
+KP_SPD = 0.20
 
-# 转向融合
-STEER_GAIN = 1.5        # 模型输出增益
-BLEND_BETA = 0.4        # 模型占比（0.4 = 模型40% + 几何60%）
+# ====== 模型主导融合 & 稳定化 ======
+MODEL_EMA_ALPHA = 0.35
 
-# Pure Pursuit / Stanley 参数
-WHEEL_BASE = 2.8        # 轴距（米）
-STEER_MAX_RAD = math.radians(35.0)  # 最大转向角
-LOOKAHEAD_MIN = 4.0     # 最小前瞻距离
-LOOKAHEAD_MAX = 12.0    # 最大前瞻距离
-LOOKAHEAD_GAIN = 0.8    # 前瞻距离 = 速度 * GAIN + MIN
+# 动态融合参数
+BLEND_BETA_MIN = 0.60
+BLEND_BETA_MAX = 0.85
+CURVE_SENS = 1.6
 
-# 其他
-SHOW_WINDOW = True
-# ============================
+# 速率限制
+MAX_DSTEER = 0.05
+
+# Pure Pursuit/Stanley 参数
+WHEEL_BASE = 2.8
+STEER_MAX_RAD = math.radians(35.0)
+LOOKAHEAD_MIN = 4.0
+LOOKAHEAD_MAX = 10.0
+LOOKAHEAD_GAIN = 0.85     # 稍增，几何更平滑
+K_STANLEY = 0.6           # 横误差增益，略保守，减少撞限
+
+ANTI_STUCK = True
+SHOW_WINDOW = False
+WIGGLE_STEPS = 0
+# =========================
+
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+# 加入 CARLA egg
+if CARLA_EGG_PATH not in sys.path:
+    sys.path.append(CARLA_EGG_PATH)
+import carla  # noqa
+
+
+# ---------- 预处理 ----------
+def preprocess_image(image_bgr):
+    img = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    img = img[CROP_TOP:-CROP_BOTTOM, :, :]
+    img = cv2.resize(img, (INPUT_WIDTH, INPUT_HEIGHT), interpolation=cv2.INTER_AREA)
+    img = np.transpose(img, (2, 0, 1))
+    img = torch.from_numpy(img).float() / 255.0
+    return img.unsqueeze(0)
+
+
+def map_pred_to_steer(raw):
+    # 将原始 raw（可能未限幅）映射到控制域
+    # 先做 tanh 限幅，避免异常值
+    raw = math.tanh(raw)
+    if LABEL_UNITS == 'norm':
+        steer_norm = raw
+    elif LABEL_UNITS == 'deg':
+        steer_norm = raw / MAX_STEER_DEG
+    elif LABEL_UNITS == 'rad':
+        steer_norm = raw / math.radians(MAX_STEER_DEG)
+    else:
+        steer_norm = raw
+    return float(np.clip(steer_norm * STEER_GAIN, -1.0, 1.0))
 
 
 def speed_of(vehicle):
-    """获取车辆速度 (m/s)"""
-    v = vehicle.get_velocity()
-    return math.sqrt(v.x**2 + v.y**2 + v.z**2)
+    """使用 utils 中的 get_speed 函数"""
+    return get_speed(vehicle.get_velocity())
 
 
-def world_to_vehicle(point_world, vehicle_transform):
-    """世界坐标转车体坐标"""
-    yaw = math.radians(vehicle_transform.rotation.yaw)
+# ---------- 坐标/几何工具 ----------
+def world_to_vehicle(vec_world, veh_transform):
+    yaw = math.radians(veh_transform.rotation.yaw)
     c, s = math.cos(-yaw), math.sin(-yaw)
-    dx = point_world.x - vehicle_transform.location.x
-    dy = point_world.y - vehicle_transform.location.y
+    dx = vec_world.x - veh_transform.location.x
+    dy = vec_world.y - veh_transform.location.y
     x_body = c * dx - s * dy
     y_body = s * dx + c * dy
     return x_body, y_body
 
 
-class AutonomousDriverV2:
-    """自动驾驶控制器 V2 - 几何+模型融合"""
-    
-    def __init__(self):
-        self.client = None
-        self.world = None
-        self.vehicle = None
-        self.camera = None
-        self.model = None
-        self.image_queue = queue.Queue()
-        self.prev_steer = 0.0
-        self.same_sign_count = 0
-        self.prev_sign = 0
-        
-    def connect(self):
-        """连接 CARLA"""
-        print("连接 CARLA...")
-        self.client = carla.Client(CARLA_HOST, CARLA_PORT)
-        self.client.set_timeout(CARLA_TIMEOUT)
-        self.world = self.client.get_world()
-        print(f"已连接，当前地图: {self.world.get_map().name}")
-        
-    def load_model(self):
-        """加载模型"""
-        print(f"加载模型: {MODEL_PATH}")
-        self.model = PilotNet().to(DEVICE)
-        
-        checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
-        if 'model_state_dict' in checkpoint:
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            self.model.load_state_dict(checkpoint)
-        
-        self.model.eval()
-        print(f"模型加载成功，设备: {DEVICE}")
-        
-    def spawn_vehicle(self):
-        """生成车辆"""
-        bp_lib = self.world.get_blueprint_library()
-        vehicle_bp = bp_lib.find('vehicle.tesla.model3')
-        
-        spawn_points = self.world.get_map().get_spawn_points()
-        spawn_point = random.choice(spawn_points)
-        
-        self.vehicle = self.world.spawn_actor(vehicle_bp, spawn_point)
-        print(f"车辆已生成: {self.vehicle.type_id}")
-        
-    def setup_camera(self):
-        """设置摄像头"""
-        bp_lib = self.world.get_blueprint_library()
-        camera_bp = bp_lib.find('sensor.camera.rgb')
-        camera_bp.set_attribute('image_size_x', str(CAMERA_WIDTH))
-        camera_bp.set_attribute('image_size_y', str(CAMERA_HEIGHT))
-        camera_bp.set_attribute('fov', str(CAMERA_FOV))
-        
-        camera_transform = carla.Transform(
-            carla.Location(x=1.5, z=2.4)
-        )
-        
-        self.camera = self.world.spawn_actor(
-            camera_bp, camera_transform, attach_to=self.vehicle
-        )
-        self.camera.listen(self.image_queue.put)
-        print("摄像头已设置")
-        
-    def setup_spectator(self):
-        """设置观众视角"""
-        spectator = self.world.get_spectator()
-        transform = self.vehicle.get_transform()
-        spectator.set_transform(carla.Transform(
-            transform.location + carla.Location(x=-10, z=5),
-            carla.Rotation(pitch=-15, yaw=transform.rotation.yaw)
-        ))
-        
-    def preprocess_image(self, image_bgr):
-        """预处理图像"""
-        img = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        img = img[CROP_TOP:-CROP_BOTTOM, :, :]
-        img = cv2.resize(img, (INPUT_WIDTH, INPUT_HEIGHT), interpolation=cv2.INTER_AREA)
-        img = np.transpose(img, (2, 0, 1))
-        img = torch.from_numpy(img).float() / 255.0
-        return img.unsqueeze(0)
-    
-    def predict_steering(self, image_bgr):
-        """模型预测转向"""
-        img_tensor = self.preprocess_image(image_bgr).to(DEVICE)
-        
-        with torch.no_grad():
-            raw = self.model(img_tensor).item()
-        
-        # 应用增益并限制范围
-        steer = float(np.clip(raw * STEER_GAIN, -1.0, 1.0))
-        return raw, steer
-    
-    def stanley_pure_pursuit_steer(self, lookahead_m):
-        """
-        Stanley + Pure Pursuit 几何控制
-        返回归一化转向 [-1, 1]
-        """
-        car_tf = self.vehicle.get_transform()
-        car_loc = car_tf.location
-        
-        # 获取当前车道
-        wp_now = self.world.get_map().get_waypoint(
-            car_loc, project_to_road=True, 
-            lane_type=carla.LaneType.Driving
-        )
-        if wp_now is None:
-            return 0.0
-        
-        # 获取前方目标点
-        wps = wp_now.next(lookahead_m)
-        wp_target = wps[0] if wps else wp_now
-        
-        # 目标点在车体坐标系的位置
-        x_t, y_t = world_to_vehicle(wp_target.transform.location, car_tf)
-        
-        # Pure Pursuit: 到目标点的方位角
-        alpha = math.atan2(y_t, max(1e-3, x_t))
-        
-        # 横向误差（Stanley用）
-        x_c, y_c = world_to_vehicle(wp_now.transform.location, car_tf)
-        e_y = y_c  # 横向误差
-        
-        # Pure Pursuit 转角
-        delta_pp = math.atan2(
-            2.0 * WHEEL_BASE * math.sin(alpha) / max(1.0, lookahead_m), 
-            1.0
-        )
-        
-        # Stanley 修正
-        k_stanley = 0.8
-        v = speed_of(self.vehicle)
-        delta_st = alpha + math.atan2(k_stanley * e_y, max(0.1, v))
-        
-        # 融合 Pure Pursuit (60%) + Stanley (40%)
-        delta = 0.6 * delta_pp + 0.4 * delta_st
-        
-        # 归一化到 [-1, 1]
-        steer_norm = float(np.clip(delta / STEER_MAX_RAD, -1.0, 1.0))
-        return steer_norm
-    
-    def compute_control(self, steer, speed):
-        """计算油门和刹车"""
-        # 速度P控制
-        throttle = BASE_THROTTLE + KP_SPEED * (TARGET_SPEED - speed)
-        throttle = float(np.clip(throttle, MIN_THROTTLE, MAX_THROTTLE))
-        
-        # 转弯时降油门
-        throttle *= (1.0 - THROTTLE_STEER_SCALE * abs(steer))
-        throttle = float(np.clip(throttle, MIN_THROTTLE, MAX_THROTTLE))
-        
-        # 超速刹车
-        brake = 0.0
-        if speed > TARGET_SPEED + 1.0:
-            brake = min(0.3, 0.08 * (speed - TARGET_SPEED))
-        
-        return throttle, brake
-    
-    def anti_spin_protection(self, steer, speed):
-        """防自旋保护：持续同向大转角时减弱"""
-        sign = 1 if steer > 0 else (-1 if steer < 0 else 0)
-        
-        if sign != 0 and sign == self.prev_sign:
-            self.same_sign_count += 1
-        else:
-            self.same_sign_count = 0
-        self.prev_sign = sign
-        
-        # 持续同向转动且车速很低时，减弱转向
-        if self.same_sign_count > 25 and abs(steer) > 0.2 and speed < 1.5:
-            steer *= 0.5
-        if self.same_sign_count > 50 and abs(steer) > 0.25 and speed < 1.0:
-            steer *= 0.3
-            
-        return steer
-    
-    def update_spectator(self):
-        """更新观众视角"""
-        spectator = self.world.get_spectator()
-        transform = self.vehicle.get_transform()
-        forward = transform.get_forward_vector()
-        spectator.set_transform(carla.Transform(
-            transform.location - forward * 10 + carla.Location(z=5),
-            carla.Rotation(pitch=-15, yaw=transform.rotation.yaw)
-        ))
-    
-    def run(self):
-        """主循环"""
-        print("\n" + "=" * 60)
-        print("开始自动驾驶 V2！（Stanley + Pure Pursuit + 模型融合）")
-        print("按 Q 或 Ctrl+C 退出")
-        print("=" * 60 + "\n")
-        
-        # 起步助推
-        print("起步中...")
-        for _ in range(20):
-            self.vehicle.apply_control(carla.VehicleControl(
-                throttle=0.5, steer=0.0, brake=0.0
-            ))
-            time.sleep(0.05)
-        
-        step = 0
-        try:
-            while True:
-                # 获取图像
-                try:
-                    carla_image = self.image_queue.get(timeout=2.0)
-                except queue.Empty:
-                    print("摄像头超时")
-                    continue
-                
-                # 转换图像
-                img = np.frombuffer(carla_image.raw_data, dtype=np.uint8)
-                img = img.reshape((carla_image.height, carla_image.width, 4))[:, :, :3]
-                
-                # 显示图像
-                if SHOW_WINDOW:
-                    cv2.imshow('Camera', img)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
-                
-                # 获取速度
-                speed = speed_of(self.vehicle)
-                
-                # 计算前瞻距离
-                lookahead = np.clip(
-                    speed * LOOKAHEAD_GAIN + LOOKAHEAD_MIN,
-                    LOOKAHEAD_MIN, LOOKAHEAD_MAX
-                )
-                
-                # 模型预测
-                raw_pred, steer_model = self.predict_steering(img)
-                
-                # 几何控制
-                steer_geo = self.stanley_pure_pursuit_steer(lookahead)
-                
-                # 融合：几何为主 + 模型辅助
-                steer = (1.0 - BLEND_BETA) * steer_geo + BLEND_BETA * steer_model
-                steer = float(np.clip(steer, -1.0, 1.0))
-                
-                # 防自旋保护
-                steer = self.anti_spin_protection(steer, speed)
-                
-                # 计算油门刹车
-                throttle, brake = self.compute_control(steer, speed)
-                
-                # 低速防卡死
-                if speed < 0.3 and step > 50 and brake == 0:
-                    throttle = max(throttle, 0.4)
-                
-                # 应用控制
-                control = carla.VehicleControl()
-                control.steer = steer
-                control.throttle = 0.0 if brake > 0 else throttle
-                control.brake = brake
-                control.hand_brake = False
-                control.reverse = False
-                self.vehicle.apply_control(control)
-                
-                # 更新视角
-                self.update_spectator()
-                
-                # 打印状态
-                print(f"\rraw:{raw_pred:+.4f} model:{steer_model:+.3f} geo:{steer_geo:+.3f} "
-                      f"final:{steer:+.3f} thr:{throttle:.2f} brk:{brake:.2f} "
-                      f"v:{speed:.1f}m/s Ld:{lookahead:.1f}", end="")
-                
-                step += 1
-                time.sleep(0.05)
-                
-        except KeyboardInterrupt:
-            print("\n\n用户中断")
-    
-    def cleanup(self):
-        """清理资源"""
-        print("\n清理中...")
-        if self.camera:
-            self.camera.stop()
-            self.camera.destroy()
-        if self.vehicle:
-            self.vehicle.destroy()
-        cv2.destroyAllWindows()
-        print("清理完成")
+def stanley_pure_pursuit_steer(world, vehicle, lookahead_m):
+    car_tf = vehicle.get_transform()
+    car_loc = car_tf.location
+
+    wp_now = world.get_map().get_waypoint(car_loc, project_to_road=True, lane_type=carla.LaneType.Driving)
+    if wp_now is None:
+        return 0.0
+
+    wps = wp_now.next(lookahead_m)
+    wp_target = wps[0] if wps else wp_now
+
+    x_t, y_t = world_to_vehicle(wp_target.transform.location, car_tf)
+    alpha = math.atan2(y_t, max(1e-3, x_t))
+
+    x_c, y_c = world_to_vehicle(wp_now.transform.location, car_tf)
+    e_y = y_c
+
+    delta_pp = math.atan2(2.0 * WHEEL_BASE * math.sin(alpha) / max(1.0, lookahead_m), 1.0)
+
+    delta_st = alpha + math.atan2(K_STANLEY * e_y, max(0.1, speed_of(vehicle)))
+
+    delta = 0.6 * delta_pp + 0.4 * delta_st
+
+    steer_norm = float(np.clip(delta / STEER_MAX_RAD, -1.0, 1.0))
+    return steer_norm
+
+
+# ========== 自标定：运行期零点偏置 ==========
+CALIB_FRAMES = 90     # 标定帧数（起步直行阶段），可调 60~150
+raw_accum = 0.0
+raw_n = 0
+raw_bias = 0.0        # 动态估计到的零点偏置
 
 
 def main():
-    driver = AutonomousDriverV2()
-    
+    ego_vehicle, camera, synchronous_enabled = None, None, False
     try:
-        driver.connect()
-        driver.load_model()
-        driver.spawn_vehicle()
-        driver.setup_camera()
-        driver.setup_spectator()
-        driver.run()
+        print('1) connecting...', flush=True)
+        client = carla.Client('localhost', 2000)
+        client.set_timeout(10.0)
+
+        world = client.load_world(WORLD_NAME) if USE_LOAD_WORLD else client.get_world()
+        print('2) world ready:', world.get_map().name, '(async)' if not USE_SYNC else '(sync)', flush=True)
+
+        if USE_SYNC:
+            settings = world.get_settings()
+            settings.synchronous_mode = True
+            settings.fixed_delta_seconds = FIXED_DELTA
+            world.apply_settings(settings)
+            synchronous_enabled = True
+
+        # 模型
+        print('3) loading model...', flush=True)
+        print('   MODEL_PATH =', os.path.abspath(MODEL_PATH), flush=True)
+        if not os.path.exists(MODEL_PATH):
+            print('   [ERROR] best_model.pth 不存在！', flush=True)
+            return
+        device = torch.device('cpu')
+        model = PilotNet().to(device)
+        state = torch.load(MODEL_PATH, map_location='cpu')
+        model.load_state_dict(state)
+        model.eval()
+        print('   model ready on CPU.', flush=True)
+
+        # 车辆
+        bp_lib = world.get_blueprint_library()
+        cand = bp_lib.filter('vehicle.tesla.model3')
+        veh_bp = random.choice(cand) if len(cand) else bp_lib.filter('vehicle.*')[0]
+        spawn = random.choice(world.get_map().get_spawn_points())
+        ego_vehicle = world.spawn_actor(veh_bp, spawn)
+
+        # 相机
+        cam_bp = bp_lib.find('sensor.camera.rgb')
+        cam_bp.set_attribute('image_size_x', str(CAM_RES_X))
+        cam_bp.set_attribute('image_size_y', str(CAM_RES_Y))
+        cam_bp.set_attribute('fov', str(CAMERA_FOV))
+        cam_bp.set_attribute('sensor_tick', '0.0' if USE_SYNC else str(FIXED_DELTA))
+        camera = world.spawn_actor(
+            cam_bp,
+            carla.Transform(carla.Location(x=1.5, z=2.4)),
+            attach_to=ego_vehicle
+        )
+
+        # 观众视角（可选）
+        try:
+            spectator = world.get_spectator()
+            tf = ego_vehicle.get_transform()
+            spectator.set_transform(carla.Transform(
+                tf.location + carla.Location(x=-15, z=3),
+                carla.Rotation(pitch=-10, yaw=tf.rotation.yaw)
+            ))
+        except Exception:
+            pass
+
+        # 图像队列
+        img_q = queue.Queue()
+        camera.listen(img_q.put)
+        print('4) actors spawned. starting loop...', flush=True)
+
+        # 起步助推（直线起步）
+        for _ in range(15):
+            ego_vehicle.apply_control(carla.VehicleControl(throttle=0.5, steer=0.0, brake=0.0))
+            if USE_SYNC: world.tick()
+            else: time.sleep(FIXED_DELTA)
+
+        prev_time = time.time()
+        step = 0
+        same_sign_count = 0
+        prev_sign = 0
+        prev_steer = 0.0
+        steer_model_ema = 0.0  # 模型转向 EMA 状态
+
+        global raw_accum, raw_n, raw_bias
+
+        while True:
+            if USE_SYNC:
+                world.tick()
+
+            try:
+                carla_img = img_q.get(timeout=1.0)
+            except queue.Empty:
+                print('no frame', flush=True)
+                continue
+
+            arr = np.frombuffer(carla_img.raw_data, dtype=np.uint8)
+            frame_bgr = arr.reshape((carla_img.height, carla_img.width, 4))[:, :, :3]
+
+            if SHOW_WINDOW:
+                cv2.imshow('Ego Camera', frame_bgr)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+            # ========= 模型推理 =========
+            with torch.no_grad():
+                inp = preprocess_image(frame_bgr).to(device)
+                raw_val = float(model(inp).item())
+
+            # 自标定：累计前 CALIB_FRAMES 帧的均值作为零点偏置
+            if raw_n < CALIB_FRAMES:
+                raw_accum += raw_val
+                raw_n += 1
+                raw_bias = raw_accum / max(1, raw_n)
+
+            raw = raw_val - raw_bias
+            steer_model = map_pred_to_steer(raw)
+
+            # 轻度 EMA 平滑
+            steer_model_ema = (1.0 - MODEL_EMA_ALPHA) * steer_model_ema + MODEL_EMA_ALPHA * steer_model
+            steer_model = float(np.clip(steer_model_ema, -1.0, 1.0))
+
+            # ========= 几何转向 =========
+            v = speed_of(ego_vehicle)
+            Ld = np.clip(v * LOOKAHEAD_GAIN + LOOKAHEAD_MIN, LOOKAHEAD_MIN, LOOKAHEAD_MAX)
+            steer_geo = stanley_pure_pursuit_steer(world, ego_vehicle, float(Ld))
+
+            # ========= 动态融合（模型主导） =========
+            # 用 |steer_geo| 作为曲率 proxy：越弯，越提升模型占比
+            curve = abs(steer_geo)
+            beta = BLEND_BETA_MIN + (BLEND_BETA_MAX - BLEND_BETA_MIN) * (1.0 - math.exp(-CURVE_SENS * curve))
+            beta = float(np.clip(beta, BLEND_BETA_MIN, BLEND_BETA_MAX))
+
+            steer = (1.0 - beta) * steer_geo + beta * steer_model
+
+            # 速率限制（避免瞬时翻向）
+            steer = float(np.clip(steer, prev_steer - MAX_DSTEER, prev_steer + MAX_DSTEER))
+            steer = float(np.clip(steer, -1.0, 1.0))
+            prev_steer = steer
+
+            # ========= 速度控制 =========
+            throttle_base = BASE_THROTTLE + KP_SPD * (TARGET_SPD - v)
+            throttle_base = float(np.clip(throttle_base, MIN_THROTTLE, MAX_THROTTLE))
+            throttle = throttle_base * (1.0 - THROTTLE_STEER_SCALE * abs(steer))
+            throttle = float(np.clip(throttle, MIN_THROTTLE, MAX_THROTTLE))
+
+            # 超速轻刹
+            brake = 0.0
+            if v > TARGET_SPD + 0.8:
+                brake = min(0.25, 0.06 * (v - TARGET_SPD))
+
+            # 反卡死
+            if ANTI_STUCK and v < 0.2 and step > 50 and brake == 0.0:
+                throttle = max(throttle, 0.35)
+
+            # 应用控制
+            ctrl = carla.VehicleControl()
+            ctrl.steer = steer
+            ctrl.throttle = 0.0 if brake > 0 else throttle
+            ctrl.brake = brake
+            ctrl.hand_brake = False
+            ctrl.reverse = False
+            ego_vehicle.apply_control(ctrl)
+
+            # 打印
+            now = time.time()
+            hz = 1.0 / max(1e-3, (now - prev_time))
+            prev_time = now
+            print(
+                f'raw:{raw_val:+.6f} raw_bias:{raw_bias:+.4f} raw_corr:{raw:+.4f} '
+                f'steer_m:{steer_model:+.3f} steer_geo:{steer_geo:+.3f} beta:{beta:.2f} '
+                f'steer:{steer:+.3f} thr:{throttle:.2f} brk:{brake:.2f} v:{v:.2f} '
+                f'Ld:{Ld:.1f} hz:{hz:.1f}', flush=True
+            )
+
+            step += 1
+            if not USE_SYNC:
+                time.sleep(FIXED_DELTA)
+
+    except KeyboardInterrupt:
+        print('\n[CTRL+C] stopping...', flush=True)
     finally:
-        driver.cleanup()
+        print('cleaning up...', flush=True)
+        try:
+            if camera:
+                camera.stop()
+                camera.destroy()
+            if ego_vehicle:
+                ego_vehicle.destroy()
+            if synchronous_enabled:
+                s = world.get_settings()
+                s.synchronous_mode = False
+                s.fixed_delta_seconds = None
+                world.apply_settings(s)
+        except Exception as e:
+            print('cleanup error:', e, flush=True)
+        cv2.destroyAllWindows()
+        print('done.', flush=True)
 
 
 if __name__ == '__main__':

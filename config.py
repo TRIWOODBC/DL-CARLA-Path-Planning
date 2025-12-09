@@ -9,13 +9,15 @@ import torch
 CARLA_EGG_PATH = r'D:\CARLA_0.9.10.1\WindowsNoEditor\PythonAPI\carla\dist\carla-0.9.10-py3.7-win-amd64.egg'
 
 # 数据目录
-DATA_DIR = "data_town04"  # Town04 弯道数据
+DATA_DIR = "data_merged_all"  # 合并后的完整数据集
 TRAIN_CSV = os.path.join(DATA_DIR, "train_labels.csv")
 VALIDATION_CSV = os.path.join(DATA_DIR, "validation_labels.csv")
 
-# 旧数据目录（训练时可以合并使用）
+# 旧数据目录（备用）
 OLD_DATA_DIR = "data_more"
-TOWN1_DATA_DIR = "data_v3"  # Town01 数据
+TOWN1_DATA_DIR = "data_v3"
+TOWN4_DATA_DIR = "data_town04"
+TOWN23_DATA_DIR = "data_v3_town2_3"
 
 # 模型保存路径
 MODEL_PATH = "best_model.pth"
@@ -72,6 +74,7 @@ TEST_RATIO = 0.15  # 测试集比例
 # 油门控制
 BASE_THROTTLE = 0.5
 MIN_THROTTLE = 0.25
+MAX_THROTTLE = 0.7  # 最大油门
 
 # 转向控制
 STEER_GAIN = 1.0  # 转向增益（降低，避免过度转向）
