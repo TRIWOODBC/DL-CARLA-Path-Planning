@@ -11,8 +11,12 @@ venv/
 # PyTorch 模型文件（太大，建议不上传）
 *.pth
 
-# 数据文件夹（太大，建议不上传）
+# 数据文件夹（太大，不上传）
 data_more/
+data_v3/
+data_v3_town2_3/
+data_town04/
+data_merged/
 
 # IDE
 .vscode/
