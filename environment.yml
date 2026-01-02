@@ -1,0 +1,18 @@
+name: carla_env
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.7
+  - pytorch=1.13.1
+  - torchvision=0.14.1
+  - torchaudio=0.13.1
+  - cpuonly
+  - numpy
+  - pandas
+  - matplotlib
+  - opencv
+  - pillow
+  - tqdm
+  - pip

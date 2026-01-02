@@ -1,4 +1,4 @@
-"""
+﻿"""
 配置文件 - 统一管理所有参数
 """
 import os
@@ -6,7 +6,7 @@ import torch
 
 # ==================== 路径配置 ====================
 # CARLA 路径
-CARLA_EGG_PATH = r'D:\CARLA_0.9.10.1\WindowsNoEditor\PythonAPI\carla\dist\carla-0.9.10-py3.7-win-amd64.egg'
+CARLA_EGG_PATH = r'E:\CARLA_0.9.10.1\WindowsNoEditor\PythonAPI\carla\dist\carla-0.9.10-py3.7-win-amd64.egg'
 
 # 数据目录
 DATA_DIR = "data_merged_all"  # 合并后的完整数据集

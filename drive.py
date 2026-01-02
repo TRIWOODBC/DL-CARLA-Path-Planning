@@ -4,6 +4,9 @@ import cv2
 import torch
 import torch.nn as nn
 
+import config
+print(f"DEBUG: config file location: {config.__file__}")
+
 # 导入配置和工具
 from config import (
     CARLA_EGG_PATH, MODEL_PATH,
@@ -58,9 +61,21 @@ WIGGLE_STEPS = 0
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 # 加入 CARLA egg
+print(f"DEBUG: CARLA_EGG_PATH = {CARLA_EGG_PATH}")
 if CARLA_EGG_PATH not in sys.path:
     sys.path.append(CARLA_EGG_PATH)
-import carla  # noqa
+    print(f"DEBUG: Added CARLA egg to sys.path")
+
+print("DEBUG: sys.path content:")
+for p in sys.path:
+    print(p)
+
+try:
+    import carla  # noqa
+    print("DEBUG: Successfully imported carla")
+except ImportError as e:
+    print(f"DEBUG: Failed to import carla: {e}")
+    raise e
 
 
 # ---------- 预处理 ----------
