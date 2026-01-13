@@ -1,61 +1,51 @@
+# -*- coding: utf-8 -*-
 import sys, os, time, math, random, queue
 import numpy as np
 import cv2
 import torch
 import torch.nn as nn
 
-# 导入配置和工具
-from config import (
-    CARLA_EGG_PATH, MODEL_PATH,
-    CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FOV,
-    CROP_TOP, CROP_BOTTOM, INPUT_WIDTH, INPUT_HEIGHT,
-    BASE_THROTTLE, MIN_THROTTLE, MAX_THROTTLE, THROTTLE_STEER_SCALE,
-    STEER_GAIN
-)
-from model import PilotNet
-from utils import get_speed
-
-# ========= 驾驶配置 =========
-WORLD_NAME = 'Town01'
+# ========= 配置区 =========
+CARLA_EGG_PATH = r'E:\CARLA_0.9.10.1\WindowsNoEditor\PythonAPI\carla\dist\carla-0.9.10-py3.7-win-amd64.egg'
+WORLD_NAME = 'Town03'
 USE_LOAD_WORLD = False
 USE_SYNC = False
 FIXED_DELTA = 0.05
 
-CAM_RES_X, CAM_RES_Y = CAMERA_WIDTH, CAMERA_HEIGHT
+CAM_RES_X, CAM_RES_Y = 1280, 720
+MODEL_PATH = 'best_model.pth'
 
-# 模型标签单位
+# 模型标签单位：'norm'（[-1,1]）、'deg'（度）、'rad'（弧度）
 LABEL_UNITS = 'norm'
 MAX_STEER_DEG = 35.0
 
-# 速度控制
-TARGET_SPD = 4.0    # m/s
-KP_SPD = 0.20
+# 控制参数
+BASE_THROTTLE = 0.40
+MIN_THROTTLE = 0.22
+MAX_THROTTLE = 0.60
+THROTTLE_STEER_SCALE = 0.6
 
-# ====== 模型主导融合 & 稳定化 ======
-MODEL_EMA_ALPHA = 0.35
+TARGET_SPD = 4.8    # m/s，先保守，稳定后可 5.5~6.0
+KP_SPD = 0.22       # 速度P控制
 
-# 动态融合参数
-BLEND_BETA_MIN = 0.60
-BLEND_BETA_MAX = 0.85
-CURVE_SENS = 1.6
-
-# 速率限制
-MAX_DSTEER = 0.05
+# 转向融合
+STEER_GAIN = 10.0   # 模型增益（若 LABEL_UNITS='rad' 可用 8~10）
+BLEND_BETA = 0.55   # β：模型占比，Stanley 70% + 模型 30%
 
 # Pure Pursuit/Stanley 参数
-WHEEL_BASE = 2.8
-STEER_MAX_RAD = math.radians(35.0)
+WHEEL_BASE = 2.8               # 近似特斯拉Model3轴距（米）
+STEER_MAX_RAD = math.radians(35.0)  # 最大方向角用于归一化
 LOOKAHEAD_MIN = 4.0
 LOOKAHEAD_MAX = 10.0
-LOOKAHEAD_GAIN = 0.85     # 稍增，几何更平滑
-K_STANLEY = 0.6           # 横误差增益，略保守，减少撞限
+LOOKAHEAD_GAIN = 0.8           # Ld = min(max, max(min, v*GAIN+MIN))
 
+# 其他
 ANTI_STUCK = True
-SHOW_WINDOW = False
-WIGGLE_STEPS = 0
+SHOW_WINDOW = False            # 若GUI卡顿就 False
+WIGGLE_STEPS = 0               # 现在不摆头，避免起步就蹭边
 # =========================
 
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["CUDA_VISIBLE_DEVICES"] = ""  # 先强制CPU，避免CUDA初始化卡住
 
 # 加入 CARLA egg
 if CARLA_EGG_PATH not in sys.path:
@@ -63,20 +53,42 @@ if CARLA_EGG_PATH not in sys.path:
 import carla  # noqa
 
 
+# ---------- 模型 ----------
+class PilotNet(nn.Module):
+    def __init__(self):
+        super(PilotNet, self).__init__()
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(3, 24, kernel_size=5, stride=2), nn.ReLU(),
+            nn.Conv2d(24, 36, kernel_size=5, stride=2), nn.ReLU(),
+            nn.Conv2d(36, 48, kernel_size=5, stride=2), nn.ReLU(),
+            nn.Conv2d(48, 64, kernel_size=3, stride=1), nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1), nn.ReLU()
+        )
+        self.fc_layers = nn.Sequential(
+            nn.Linear(64 * 1 * 18, 100), nn.ReLU(),
+            nn.Linear(100, 50), nn.ReLU(),
+            nn.Linear(50, 10), nn.ReLU(),
+            nn.Linear(10, 1)
+        )
+
+    def forward(self, x):
+        x = self.conv_layers(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc_layers(x)
+        return x
+
+
 # ---------- 预处理 ----------
 def preprocess_image(image_bgr):
     img = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    img = img[CROP_TOP:-CROP_BOTTOM, :, :]
-    img = cv2.resize(img, (INPUT_WIDTH, INPUT_HEIGHT), interpolation=cv2.INTER_AREA)
+    img = img[60:-25, :, :]
+    img = cv2.resize(img, (200, 66), interpolation=cv2.INTER_AREA)
     img = np.transpose(img, (2, 0, 1))
     img = torch.from_numpy(img).float() / 255.0
-    return img.unsqueeze(0)
+    return img.unsqueeze(0)  # (1,3,66,200)
 
 
 def map_pred_to_steer(raw):
-    # 将原始 raw（可能未限幅）映射到控制域
-    # 先做 tanh 限幅，避免异常值
-    raw = math.tanh(raw)
     if LABEL_UNITS == 'norm':
         steer_norm = raw
     elif LABEL_UNITS == 'deg':
@@ -89,53 +101,63 @@ def map_pred_to_steer(raw):
 
 
 def speed_of(vehicle):
-    """使用 utils 中的 get_speed 函数"""
-    return get_speed(vehicle.get_velocity())
+    v = vehicle.get_velocity()
+    return math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
 
 
 # ---------- 坐标/几何工具 ----------
 def world_to_vehicle(vec_world, veh_transform):
+    # 把世界坐标的向量投到车体坐标系（前为+X，左为+Y）
     yaw = math.radians(veh_transform.rotation.yaw)
     c, s = math.cos(-yaw), math.sin(-yaw)
     dx = vec_world.x - veh_transform.location.x
     dy = vec_world.y - veh_transform.location.y
+    # 旋转到车体坐标
     x_body = c * dx - s * dy
     y_body = s * dx + c * dy
     return x_body, y_body
 
 
 def stanley_pure_pursuit_steer(world, vehicle, lookahead_m):
+    """
+    计算面向 lookahead_m 处车道中心点的转向（归一化到 [-1,1]）
+    组合了 Pure Pursuit（目标点角度） + 轻度Stanley（横向误差）
+    """
     car_tf = vehicle.get_transform()
     car_loc = car_tf.location
+    car_yaw = math.radians(car_tf.rotation.yaw)
 
+    # 最近车道中心（投影到道路）
     wp_now = world.get_map().get_waypoint(car_loc, project_to_road=True, lane_type=carla.LaneType.Driving)
     if wp_now is None:
         return 0.0
 
+    # 前方 lookahead_m 的参考点
     wps = wp_now.next(lookahead_m)
     wp_target = wps[0] if wps else wp_now
 
+    # 目标点在车体坐标系的位置
     x_t, y_t = world_to_vehicle(wp_target.transform.location, car_tf)
-    alpha = math.atan2(y_t, max(1e-3, x_t))
-
+    # 目标朝向与车辆朝向的误差（Pure Pursuit）
+    alpha = math.atan2(y_t, max(1e-3, x_t))  # 车体系下到目标点的方位角
+    # 横向误差（Stanley）
     x_c, y_c = world_to_vehicle(wp_now.transform.location, car_tf)
-    e_y = y_c
+    e_y = y_c  # 当前中心线点到车体的横向误差（左为正）
 
+    # Pure Pursuit 转角（轮角）
+    # delta_pp = atan2(2*L*sin(alpha)/Ld, 1)
     delta_pp = math.atan2(2.0 * WHEEL_BASE * math.sin(alpha) / max(1.0, lookahead_m), 1.0)
 
-    delta_st = alpha + math.atan2(K_STANLEY * e_y, max(0.1, speed_of(vehicle)))
+    # Stanley 修正：heading误差用 alpha 代替，横向误差项 e_y
+    k_st = 0.8
+    delta_st = alpha + math.atan2(k_st * e_y, max(0.1, speed_of(vehicle)))
 
+    # 融合（权重可再调）
     delta = 0.6 * delta_pp + 0.4 * delta_st
 
+    # 归一化到 [-1,1] 控制
     steer_norm = float(np.clip(delta / STEER_MAX_RAD, -1.0, 1.0))
     return steer_norm
-
-
-# ========== 自标定：运行期零点偏置 ==========
-CALIB_FRAMES = 90     # 标定帧数（起步直行阶段），可调 60~150
-raw_accum = 0.0
-raw_n = 0
-raw_bias = 0.0        # 动态估计到的零点偏置
 
 
 def main():
@@ -179,7 +201,7 @@ def main():
         cam_bp = bp_lib.find('sensor.camera.rgb')
         cam_bp.set_attribute('image_size_x', str(CAM_RES_X))
         cam_bp.set_attribute('image_size_y', str(CAM_RES_Y))
-        cam_bp.set_attribute('fov', str(CAMERA_FOV))
+        cam_bp.set_attribute('fov', '90')
         cam_bp.set_attribute('sensor_tick', '0.0' if USE_SYNC else str(FIXED_DELTA))
         camera = world.spawn_actor(
             cam_bp,
@@ -213,10 +235,6 @@ def main():
         step = 0
         same_sign_count = 0
         prev_sign = 0
-        prev_steer = 0.0
-        steer_model_ema = 0.0  # 模型转向 EMA 状态
-
-        global raw_accum, raw_n, raw_bias
 
         while True:
             if USE_SYNC:
@@ -236,43 +254,35 @@ def main():
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
-            # ========= 模型推理 =========
+            # 模型推理
             with torch.no_grad():
                 inp = preprocess_image(frame_bgr).to(device)
-                raw_val = float(model(inp).item())
-
-            # 自标定：累计前 CALIB_FRAMES 帧的均值作为零点偏置
-            if raw_n < CALIB_FRAMES:
-                raw_accum += raw_val
-                raw_n += 1
-                raw_bias = raw_accum / max(1, raw_n)
-
-            raw = raw_val - raw_bias
+                raw = float(model(inp).item())
             steer_model = map_pred_to_steer(raw)
 
-            # 轻度 EMA 平滑
-            steer_model_ema = (1.0 - MODEL_EMA_ALPHA) * steer_model_ema + MODEL_EMA_ALPHA * steer_model
-            steer_model = float(np.clip(steer_model_ema, -1.0, 1.0))
-
-            # ========= 几何转向 =========
+            # 几何转向（主控）
             v = speed_of(ego_vehicle)
             Ld = np.clip(v * LOOKAHEAD_GAIN + LOOKAHEAD_MIN, LOOKAHEAD_MIN, LOOKAHEAD_MAX)
             steer_geo = stanley_pure_pursuit_steer(world, ego_vehicle, float(Ld))
 
-            # ========= 动态融合（模型主导） =========
-            # 用 |steer_geo| 作为曲率 proxy：越弯，越提升模型占比
-            curve = abs(steer_geo)
-            beta = BLEND_BETA_MIN + (BLEND_BETA_MAX - BLEND_BETA_MIN) * (1.0 - math.exp(-CURVE_SENS * curve))
-            beta = float(np.clip(beta, BLEND_BETA_MIN, BLEND_BETA_MAX))
-
-            steer = (1.0 - beta) * steer_geo + beta * steer_model
-
-            # 速率限制（避免瞬时翻向）
-            steer = float(np.clip(steer, prev_steer - MAX_DSTEER, prev_steer + MAX_DSTEER))
+            # 融合
+            steer = (1.0 - BLEND_BETA) * steer_geo + BLEND_BETA * steer_model
             steer = float(np.clip(steer, -1.0, 1.0))
-            prev_steer = steer
 
-            # ========= 速度控制 =========
+            # 防自旋：若持续同向大打角且车速上不来，强行压小
+            sign = 1 if steer > 0 else (-1 if steer < 0 else 0)
+            if sign != 0 and sign == prev_sign:
+                same_sign_count += 1
+            else:
+                same_sign_count = 0
+            prev_sign = sign
+
+            if same_sign_count > 20 and abs(steer) > 0.20 and v < 1.2:
+                steer *= 0.5  # 降半
+            if same_sign_count > 40 and abs(steer) > 0.25 and v < 0.8:
+                steer *= 0.35 # 更狠一点
+
+            # 速度控制 + 弯中降油
             throttle_base = BASE_THROTTLE + KP_SPD * (TARGET_SPD - v)
             throttle_base = float(np.clip(throttle_base, MIN_THROTTLE, MAX_THROTTLE))
             throttle = throttle_base * (1.0 - THROTTLE_STEER_SCALE * abs(steer))
@@ -283,7 +293,8 @@ def main():
             if v > TARGET_SPD + 0.8:
                 brake = min(0.25, 0.06 * (v - TARGET_SPD))
 
-            # 反卡死
+            # 反卡死（可用可不用：几乎不动时小幅脉冲）
+            # 但在有Stanley主控后通常不再需要激进倒车，这里只留轻微处理
             if ANTI_STUCK and v < 0.2 and step > 50 and brake == 0.0:
                 throttle = max(throttle, 0.35)
 
@@ -300,12 +311,9 @@ def main():
             now = time.time()
             hz = 1.0 / max(1e-3, (now - prev_time))
             prev_time = now
-            print(
-                f'raw:{raw_val:+.6f} raw_bias:{raw_bias:+.4f} raw_corr:{raw:+.4f} '
-                f'steer_m:{steer_model:+.3f} steer_geo:{steer_geo:+.3f} beta:{beta:.2f} '
-                f'steer:{steer:+.3f} thr:{throttle:.2f} brk:{brake:.2f} v:{v:.2f} '
-                f'Ld:{Ld:.1f} hz:{hz:.1f}', flush=True
-            )
+            print(f'raw:{raw:.6f} steer_m:{steer_model:+.3f} steer_geo:{steer_geo:+.3f} '
+                  f'steer:{steer:+.3f} thr:{throttle:.2f} brk:{brake:.2f} v:{v:.2f} '
+                  f'Ld:{Ld:.1f} same:{same_sign_count} hz:{hz:.1f}', flush=True)
 
             step += 1
             if not USE_SYNC:
